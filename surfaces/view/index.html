@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>주간 메모 정리</title>
+<link rel="stylesheet" href="/assets/chat-app.css">
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Segoe UI", Roboto, sans-serif;
+    color: #2b2b30;
+    background: #f6f5f2;
+  }
+  header.top {
+    padding: 20px 24px 16px;
+    border-bottom: 1px solid #e6e3dd;
+    background: #fffdf9;
+  }
+  header.top h1 { margin: 0; font-size: 20px; display: flex; align-items: center; gap: 8px; }
+  header.top p { margin: 6px 0 0; color: #7a756c; font-size: 13px; }
+  .wrap { display: flex; min-height: calc(100vh - 74px); }
+  .list { width: 320px; flex: none; border-right: 1px solid #e6e3dd; background: #fbfaf7; overflow-y: auto; }
+  .list h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #9a948a; margin: 0; padding: 16px 18px 8px; }
+  .item { padding: 12px 18px; border-bottom: 1px solid #efece6; cursor: pointer; }
+  .item:hover { background: #f3f0e9; }
+  .item.active { background: #efeae0; }
+  .item .t { font-weight: 600; font-size: 14px; margin-bottom: 3px; }
+  .item .m { font-size: 12px; color: #8a857c; }
+  .reader { flex: 1; padding: 28px 32px; overflow-y: auto; }
+  .reader .inner { max-width: 760px; }
+  .reader .meta { color: #8a857c; font-size: 13px; margin-bottom: 18px; }
+  .reader h2.title { margin: 0 0 4px; font-size: 22px; }
+  .reader .body h2 { font-size: 18px; margin: 22px 0 8px; }
+  .reader .body h3 { font-size: 15px; margin: 18px 0 6px; color: #4a4640; }
+  .reader .body ul { margin: 6px 0 12px; padding-left: 20px; }
+  .reader .body li { margin: 3px 0; line-height: 1.55; }
+  .reader .body p { line-height: 1.65; margin: 8px 0; }
+  .empty { color: #8a857c; font-size: 14px; line-height: 1.7; }
+  .empty strong { color: #5a554d; }
+  .hint { margin-top: 14px; padding: 12px 14px; background: #fff7e8; border: 1px solid #f0e2c4; border-radius: 8px; font-size: 13px; color: #7a6a45; }
+  .toast { position: fixed; left: 24px; bottom: 24px; background: #2b2b30; color: #fff; padding: 10px 16px; border-radius: 999px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 40; }
+  .toast.show { opacity: .96; }
+  @media (max-width: 720px) {
+    .wrap { flex-direction: column; }
+    .list { width: auto; border-right: none; border-bottom: 1px solid #e6e3dd; max-height: 38vh; }
+  }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1><span>🗂️</span> 주간 메모 정리</h1>
+  <p>메모 집사에 쌓인 메모를 매주 주제별로 묶어 둡니다.</p>
+</header>
+<div class="wrap">
+  <aside class="list">
+    <h2>정리 목록</h2>
+    <div id="items"></div>
+  </aside>
+  <main class="reader"><div class="inner" id="reader"></div></main>
+</div>
+<div class="toast" id="toast"></div>
+
+<!-- 곁에 뜨는 대화창은 기판이 준다 (자동 마운트) -->
+<script type="module" src="/assets/chat-app.js"></script>
+
+<script>
+const ctx = window.__RELAY_CONTEXT || { base: "" };
+const base = ctx.base || "";
+const $items = document.getElementById("items");
+const $reader = document.getElementById("reader");
+const $toast = document.getElementById("toast");
+let current = null;
+let digests = [];
+
+async function verb(name, input = {}) {
+  const res = await fetch(`${base}/script/${name}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ input }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || (data && data.error)) throw new Error((data && data.error) || res.status);
+  return data.result;
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// 작은 마크다운 렌더러 — 제목(#/##/###), 목록(-, *), 굵게(**), 문단.
+function renderMd(md) {
+  const lines = String(md == null ? "" : md).split("\n");
+  const inline = (t) => esc(t).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  let html = "";
+  let inList = false;
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, "");
+    const li = /^\s*[-*]\s+(.*)$/.exec(line);
+    if (li) { if (!inList) { html += "<ul>"; inList = true; } html += `<li>${inline(li[1])}</li>`; continue; }
+    if (inList) { html += "</ul>"; inList = false; }
+    if (/^###\s+/.test(line)) html += `<h3>${inline(line.replace(/^###\s+/, ""))}</h3>`;
+    else if (/^##\s+/.test(line)) html += `<h2>${inline(line.replace(/^##\s+/, ""))}</h2>`;
+    else if (/^#\s+/.test(line)) html += `<h2>${inline(line.replace(/^#\s+/, ""))}</h2>`;
+    else if (line.trim() !== "") html += `<p>${inline(line)}</p>`;
+  }
+  if (inList) html += "</ul>";
+  return html;
+}
+
+function fmtPeriod(d) {
+  if (d.period_start && d.period_end) return `${d.period_start} ~ ${d.period_end}`;
+  return d.period_end || d.period_start || "";
+}
+
+function renderList() {
+  if (!digests.length) {
+    $items.innerHTML = `<div style="padding:16px 18px;color:#9a948a;font-size:13px;line-height:1.6">아직 정리가 없어요.</div>`;
+    return;
+  }
+  $items.innerHTML = digests.map((d) => `
+    <div class="item ${d.id === current ? "active" : ""}" data-id="${esc(d.id)}">
+      <div class="t">${esc(d.title)}</div>
+      <div class="m">${esc(fmtPeriod(d))} · 메모 ${d.memo_count || 0}개</div>
+    </div>`).join("");
+  for (const el of $items.querySelectorAll(".item")) {
+    el.addEventListener("click", () => openDigest(el.getAttribute("data-id")));
+  }
+}
+
+function renderEmptyReader() {
+  $reader.innerHTML = `
+    <div class="empty">
+      <p><strong>아직 만들어진 주간 정리가 없습니다.</strong></p>
+      <p>메모 집사에 메모를 적어 두시면, 매주 월요일 아침에 지난 한 주의 메모가 주제별로 자동 정리됩니다.</p>
+      <div class="hint">지금 바로 보고 싶으시면 오른쪽 아래 대화창에 <strong>"이번 주 메모 정리해줘"</strong>라고 말해 보세요.</div>
+    </div>`;
+}
+
+async function openDigest(id) {
+  current = id;
+  renderList();
+  try {
+    const d = await verb("digest-read", { id });
+    $reader.innerHTML = `
+      <h2 class="title">${esc(d.title)}</h2>
+      <div class="meta">${esc(fmtPeriod(d))} · 메모 ${d.memo_count || 0}개</div>
+      <div class="body">${renderMd(d.body)}</div>`;
+    scene(`주간 정리 "${d.title}" 열어 보는 중`);
+  } catch (e) {
+    $reader.innerHTML = `<div class="empty">정리를 여는 데 실패했어요: ${esc(e.message)}</div>`;
+  }
+}
+
+async function reload(keepReader) {
+  try {
+    const r = await verb("digest-list", { limit: 100 });
+    digests = (r && r.digests) || [];
+  } catch (e) {
+    digests = [];
+  }
+  renderList();
+  if (!digests.length) { current = null; renderEmptyReader(); return; }
+  if (keepReader && current && digests.some((d) => d.id === current)) return;
+  if (!current || !digests.some((d) => d.id === current)) openDigest(digests[0].id);
+}
+
+function scene(text) {
+  window.dispatchEvent(new CustomEvent("relay:scene", { detail: { scene: text } }));
+}
+function toast(text) {
+  $toast.textContent = text;
+  $toast.classList.add("show");
+  setTimeout(() => $toast.classList.remove("show"), 2600);
+}
+
+// 에이전트가 정리를 새로 만들거나 고치면 목록을 다시 읽는다 (조용히 바꾸지 않고 알린다)
+window.addEventListener("relay:turn", (e) => {
+  if (!e.detail || e.detail.phase !== "settled") return;
+  const before = digests.length;
+  reload(true).then(() => {
+    if (digests.length > before) toast("주간 정리가 새로 만들어졌어요");
+  });
+});
+
+reload();
+</script>
+</body>
+</html>

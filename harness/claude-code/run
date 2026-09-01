@@ -1,0 +1,833 @@
+#!/bin/bash
+set -eo pipefail
+VERB="${1:-session}"
+
+case "$VERB" in
+  info)
+    LOGIN=""
+    EFFORT=0
+    if command -v claude >/dev/null 2>&1; then
+      # auth status 는 미로그인일 때도 JSON 을 내고 종료코드 1 로 끝난다(도구 소스 실증).
+      # 여기에 `|| echo {}` 를 붙이면 두 JSON 이 이어붙어 파싱이 터지고 info 가 통째로 침묵한다 —
+      # 로그인 안 한 사용자가 하네스를 설치조차 못 하게 된다. stdout 만 취하고 파싱은 관대하게
+      LOGIN="$(claude auth status --json 2>/dev/null || true)"
+      # capabilities 는 물리적 능력만 — effort 는 CLI 가 실제로 아는 경우에만 선언한다
+      if claude --help 2>/dev/null | grep -q -- '--effort'; then EFFORT=1; fi
+    fi
+    LOGIN="$LOGIN" EFFORT="$EFFORT" node --input-type=module -e '
+let a = {};
+try { a = JSON.parse(process.env.LOGIN || "{}"); } catch { /* 형식이 바뀌면 계정 미상으로 강등 */ }
+const caps = ["cancel", "vision", "resume", "ask", "tasks"];
+if (process.env.EFFORT === "1") caps.push("effort");
+process.stdout.write(JSON.stringify({
+  name: "claude-code",
+  provider: "anthropic",
+  protocol: 3,
+  verbs: ["session", "serve", "setup", "login", "models", "commands", "info"],
+  capabilities: caps,
+  account: a.loggedIn ? { email: a.email ?? null, plan: a.subscriptionType ?? null, method: a.authMethod ?? null } : null,
+}));'
+    exit 0
+    ;;
+  setup)
+    # 종료코드가 미준비의 축이다: 0 준비됨 · 3 도구 없음 · 그 외 비0 자격 없음
+    if ! command -v claude >/dev/null 2>&1; then
+      echo "claude CLI 없음: npm install -g @anthropic-ai/claude-code"
+      exit 3
+    fi
+    VER="$(claude --version 2>/dev/null | head -1)"
+    ST="$(claude auth status --json 2>/dev/null || true)"
+    if ! ST="$ST" VER="$VER" node --input-type=module -e '
+let a = {};
+try { a = JSON.parse(process.env.ST || "{}"); } catch { /* 파싱 실패 = 자격을 확인하지 못함 */ }
+if (!a.loggedIn) {
+  process.stdout.write("로그인 필요: relay login <패키지> 를 실행하세요 (구독 로그인)");
+  process.exit(1);
+}
+const who = [a.email, a.subscriptionType && a.subscriptionType + " 플랜", a.authMethod].filter(Boolean).join(" · ");
+process.stdout.write(process.env.VER + "\n" + who);'; then
+      exit 1
+    fi
+    exit 0
+    ;;
+  login)
+    # 처방(쓰기) — setup 이 진단이라면 이쪽이 치료다. 대화형이라 TTY 를 그대로 물려받는다.
+    #   기본: 구독 로그인(claude auth login). 이미 로그인돼 있어도 계정 전환 경로다
+    #   --switch: 기존 자격을 비우고 다시 로그인 (계정 갈아타기)
+    #   --token: 장기 토큰 발급(claude setup-token) — 그 값은 사용자가 relay connect 로 vault 에 넣는다
+    #
+    # headless 로그인 적합성(기판이 pty 로 감싸 출력·입력을 화면과 중계한다):
+    # claude auth login 은 선택 메뉴 없이 평문 세 줄(Opening browser… / If the browser didn't
+    # open, visit: <URL> / Paste code here if prompted > )을 stdout 에 쓰고 readline 으로
+    # 줄 단위 stdin 을 받는다. 전체화면 TUI 도 raw key 도 쓰지 않으므로 중계로 성립한다.
+    # 로그인 방식은 무플래그 기본이 구독(claudeai)이다 — 메뉴가 뜨지 않는다.
+    # 반면 setup-token 은 Ink 전체화면이라 중계로 못 쓴다: --token 은 사람이 보는 터미널 전용이다
+    if ! command -v claude >/dev/null 2>&1; then
+      echo "claude CLI 없음: npm install -g @anthropic-ai/claude-code"
+      exit 3
+    fi
+    if [ "${2:-}" = "--token" ]; then
+      exec claude setup-token
+    fi
+    # 로그아웃 없이 login 만 부르면 도구가 "이미 로그인됨" 으로 끝나 전환이 안 되는 구현이 있다.
+    # 전환은 명시 동작이므로 자격을 먼저 비운다
+    if [ "${2:-}" = "--switch" ]; then
+      claude auth logout >/dev/null 2>&1 || true
+    fi
+    exec claude auth login
+    ;;
+  models)
+    # 정본 = Anthropic /v1/models. 자격이 기판 손(ANTHROPIC_API_KEY)에 있을 때만 닿는다 —
+    # 구독 로그인 자격은 도구가 Keychain 에 쥐고 있어 여기서 빌려 쓰지 않는다.
+    # 강등은 도구가 스스로 문서화한 별칭(--help 의 --model 예시)까지만이다. 어댑터 소스에
+    # 어휘를 하드코딩하면 CLI 버전과 어긋난 항목이 정본 행세를 한다 — fable 을 별칭 목록에
+    # 박았다가 그 별칭을 모르는 CLI(2.1.153)가 세션마다 404 로 죽은 실사고(2026-08-07).
+    # 그마저 못 읽으면 다음 한 걸음을 적은 안내 항목 하나로 강등한다(빈 목록 금지)
+    HELP="$(claude --help 2>/dev/null || true)"
+    HELP="$HELP" node --input-type=module -e '
+const out = (xs) => process.stdout.write(JSON.stringify([...new Set(xs)]));
+const degrade = (why, xs) => { process.stderr.write("models 강등 — " + why + "\n"); out(xs); };
+
+// 도구 자기선언 어휘 = --help 의 --model 설명이 따옴표로 든 별칭 예시.
+// 전체 id 예시(claude-sonnet-4-6 류)는 형식 안내이지 별칭이 아니라서 소문자 단일 단어만 취한다
+function toolAliases() {
+  const help = process.env.HELP ?? "";
+  const at = help.indexOf("--model");
+  if (at < 0) return [];
+  const end = help.indexOf("\n  -", at);
+  const seg = help.slice(at, end < 0 ? undefined : end);
+  return [...seg.matchAll(/\x27([a-z]+)\x27/g)].map((m) => m[1]);
+}
+const ALIAS = toolAliases();
+const GUIDE = ["(모델 id 직접 입력 — ANTHROPIC_API_KEY 연결 시 전체 목록이 나옵니다)"];
+
+const key = process.env.ANTHROPIC_API_KEY;
+if (!key) {
+  if (ALIAS.length) degrade("ANTHROPIC_API_KEY 없음 — 도구가 문서화한 별칭만 노출한다", ALIAS);
+  else degrade("ANTHROPIC_API_KEY 없음, 도구의 별칭 문서도 못 읽음", GUIDE);
+  process.exit(0);
+}
+
+try {
+  const res = await fetch("https://api.anthropic.com/v1/models?limit=100", {
+    headers: { "anthropic-version": "2023-06-01", "x-api-key": key },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(String(res.status));
+  const j = await res.json();
+  const ids = (Array.isArray(j?.data) ? j.data : [])
+    .filter((m) => m && typeof m.id === "string" && m.id)
+    .sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")))
+    .map((m) => m.id);
+  if (ids.length) out([...ALIAS, ...ids]);
+  else degrade("API 응답에 모델이 없음", ALIAS.length ? ALIAS : GUIDE);
+} catch (e) {
+  degrade("API 조회 실패: " + (e?.message ?? e), ALIAS.length ? ALIAS : GUIDE);
+}'
+    exit 0
+    ;;
+  commands)
+    # 하네스 내장 슬래시 커맨드 + 이 패키지에 조립된 커맨드는 기판이 병합한다.
+    # tty 판정 근거는 도구가 스스로 낸 목록이다: clear·compact 는 -p 세션의 슬래시 목록에도
+    # 올라오므로 headless 에서도 먹고, model·resume·status·memory 는 대화형 REPL 에만 있다
+    echo '[{"name":"compact","description":"지금까지의 대화를 요약해 컨텍스트를 비운다"},
+ {"name":"clear","description":"빈 컨텍스트로 새 세션을 연다 (이전 세션은 디스크에 남는다)"},
+ {"name":"model","description":"이 세션의 모델을 바꾼다","tty":true},
+ {"name":"resume","description":"이전 대화를 고른다","tty":true},
+ {"name":"status","description":"버전·모델·계정·도구 상태를 본다","tty":true},
+ {"name":"context","description":"컨텍스트 사용량을 본다","tty":true},
+ {"name":"memory","description":"CLAUDE.md 메모리를 연다","tty":true}]'
+    exit 0
+    ;;
+  session|serve)
+    # workspace 메모리 셔틀 — 정본은 AGENTS.md 다(codex·kimi 가 네이티브로 읽는 중립 규약,
+    # harness-protocol §memory). claude 의 프로젝트 메모리 규약은 CLAUDE.md 라 이름이 갈리는데,
+    # CLAUDE.md 는 @경로 import 를 지원하므로 import 한 줄로 정본을 잇는다. 이 파일들은 조립
+    # 산출물이 아니라 도구 자신이 cwd 에 쓰는 메모리 규약 파일이다 — "cwd 를 건드리지 않는다"
+    # 규율(아래)은 조립을 말하는 것이고, 메모리는 도구가 이미 소유한 cwd 표면이다.
+    #   · CLAUDE.md 없음 + AGENTS.md 있음 → import 한 줄짜리 CLAUDE.md 생성 (# 메모리도 여기 쌓인다)
+    #   · CLAUDE.md 있음 + AGENTS.md 없음 → 내용을 정본으로 승격하고 CLAUDE.md 는 import 로 교체
+    #   · 둘 다 있음/없음 → 손대지 않는다 (사용자 파일 존중 · 빈 약속 생성 금지)
+    if [ ! -e CLAUDE.md ] && [ -f AGENTS.md ]; then
+      printf '@AGENTS.md\n' > CLAUDE.md
+    elif [ -f CLAUDE.md ] && [ ! -e AGENTS.md ]; then
+      if [ "$(cat CLAUDE.md 2>/dev/null)" = "@AGENTS.md" ]; then
+        : > AGENTS.md   # 홀로 남은 import — 정본 자리를 만들어 dangling 을 없앤다
+      else
+        cp CLAUDE.md AGENTS.md && printf '@AGENTS.md\n' > CLAUDE.md
+      fi
+    fi
+    ;;
+  *)
+    echo "지원하지 않는 동사: $VERB (session|serve|setup|login|models|commands|info)"
+    exit 2
+    ;;
+esac
+
+B="$RELAY_BUNDLE"
+
+# agent_dispatch 는 서브에이전트 완료까지 블로킹하는 장기 툴콜이다 — claude 기본 MCP 타임아웃에
+# 먼저 잘리면 정직한 완료·실패가 모델에 못 닿는다. 운영자 명시값은 존중(org 기판과 같은 값)
+if [ -z "${MCP_TOOL_TIMEOUT:-}" ]; then
+  export MCP_TOOL_TIMEOUT=240000
+fi
+
+# 조립은 전부 플래그로 넣는다 — cwd(workspace)도, 사용자의 ~/.claude 도 건드리지 않는다.
+#
+# CLAUDE_CONFIG_DIR 격리는 쓰지 않는다: 구독 로그인 자격은 도구 소유(Keychain)이고 설정
+# 디렉토리를 옮기면 그 자격에 닿지 못해 "Not logged in" 으로 죽는다(2026-08-06 실증).
+# 자격이 기판 손에 있는 경우(ANTHROPIC_API_KEY)에만 격리가 성립하므로 그때만 켠다
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  CFG="$B/claude"
+  mkdir -p "$CFG"
+  [ -f "$CFG/.claude.json" ] || echo '{"hasCompletedOnboarding":true}' > "$CFG/.claude.json"
+  export CLAUDE_CONFIG_DIR="$CFG"
+fi
+
+B="$B" node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+const B = process.env.B;
+const meta = JSON.parse(fs.readFileSync(B + "/meta.json", "utf8"));
+
+// ① 시스템 프롬프트 = persona + 기판 문맥(무대, 담장). append 라 도구 사용 지침은 살아 있다
+let doc = fs.readFileSync(B + "/persona.md", "utf8");
+doc += "\n\n# 기판 (Relay)\n"
+  + "- 작업 무대(cwd): " + (meta.cwd ?? process.cwd()) + "\n"
+  + "- 파일 교환 무대: " + meta.stage + " — 사용자에게 채팅으로 전달할 파일은 여기 놓는다. 첨부도 여기서 온다\n"
+  + "- 접근 금지: " + (meta.hooks?.deny ?? []).join(", ") + " — 도구 호출이 차단된다\n";
+// ③ 서브에이전트 위임 — 기판 소유다(2026-08-20 단일화, harness-protocol §subagents).
+// 구 --agents(하네스 네이티브 Task) 번역은 은퇴했다: 하네스마다 의미가 갈렸고(네이티브가
+// 없는 도구는 강등으로 실행 자체가 안 됐다), 부모 세션 안에서 돌아 세션 목록·위임 카드에
+// 보이지 않았다. 이제 위임 안내를 문서 절로 싣고, 실행은 기판의 agent_dispatch MCP 도구가
+// 별도 세션으로 돌린다 — 어느 하네스든 같은 그림.
+for (const a of meta.agents ?? []) {
+  const src = path.join(B, "agents", a.name + ".md");
+  if (!fs.existsSync(src)) continue;
+  const first = fs.readFileSync(src, "utf8").split("\n").find((l) => l.trim()) ?? "";
+  doc += "\n\n# 위임 가능: " + a.name + "\n" + (first ? first.trim() + "\n" : "")
+    + "이 역할의 일은 직접 하지 말고 relay 의 agent_dispatch 도구로 위임하라 — "
+    + "별도 세션에서 돌고 완료 결과가 돌아온다. 맥락은 공유되지 않으니 지시에 필요한 배경을 담아라.\n";
+}
+
+fs.writeFileSync(B + "/system.md", doc);
+
+// ② 스킬·커맨드 = 플러그인 디렉토리. 사용자의 ~/.claude 나 cwd 를 오염하지 않는 유일한 경로.
+// 매니페스트 정본 위치는 .claude-plugin/plugin.json 이다 — 루트에 두면 도구가 읽지 않고
+// 디렉토리 이름을 플러그인 이름으로 삼아 커맨드 접두가 통째로 어긋난다(2026-08-06 실측)
+const plugin = "relay-" + String(meta.pkg).replace(/[^a-zA-Z0-9-]/g, "-");
+const PL = path.join(B, "plugin");
+fs.rmSync(PL, { recursive: true, force: true });
+fs.mkdirSync(path.join(PL, ".claude-plugin"), { recursive: true });
+fs.writeFileSync(path.join(PL, ".claude-plugin", "plugin.json"), JSON.stringify({
+  name: plugin,
+  version: "0.1.0",
+  description: meta.pkg + " 패키지 번들",
+}));
+for (const sub of ["skills", "commands"]) {
+  if (fs.existsSync(path.join(B, sub))) fs.cpSync(path.join(B, sub), path.join(PL, sub), { recursive: true });
+}
+
+// 플러그인 커맨드는 <플러그인>:<이름> 으로만 풀린다 — 선언 이름 그대로 부르면 Unknown command 다.
+// 기판 화면은 선언 이름을 보여주므로 headless 진입에서 선두 /이름 을 접두 붙여 번역한다.
+// 그 사전이 slash.json 이다 (TTY 는 도구 자동완성이 접두형을 그대로 보여주므로 손대지 않는다)
+const cmdDir = path.join(B, "commands");
+const names = fs.existsSync(cmdDir)
+  ? fs.readdirSync(cmdDir).filter((f) => f.endsWith(".md")).map((f) => f.slice(0, -3))
+  : [];
+fs.writeFileSync(B + "/slash.json", JSON.stringify({ prefix: plugin, names }));
+
+
+// MCP 문 배선 — meta.mcpServers(복수, additive)가 있으면 선언 이름 그대로 앉힌다: 도구명이
+// mcp__<이름>__* 로 서서 기판 표면의 정확명 매칭이 어댑터와 무관해진다. authorization 은
+// Authorization 헤더 값, headers 는 다른 이름으로 인증하는 문의 불투명 추가 헤더다.
+// 복수 선언이 비어 있으면 구형 단일 meta.mcp 를 서버명 relay 로 (기존 임베더 무변)
+const doors = {};
+for (const [nm, d] of Object.entries(meta.mcpServers && typeof meta.mcpServers === "object" ? meta.mcpServers : {})) {
+  if (!d || typeof d.url !== "string" || !d.url) continue; // url 없는 항목은 계약 밖 — 추측 금지
+  const headers = {};
+  for (const [h, v] of Object.entries(d.headers && typeof d.headers === "object" ? d.headers : {})) {
+    if (typeof v === "string") headers[h] = v;
+  }
+  if (typeof d.authorization === "string" && d.authorization) headers.Authorization = d.authorization;
+  doors[nm] = { type: "http", url: d.url, ...(Object.keys(headers).length ? { headers } : {}) };
+}
+if (!Object.keys(doors).length) {
+  doors.relay = { type: "http", url: meta.mcp.url, headers: { Authorization: meta.mcp.authorization } };
+}
+fs.writeFileSync(B + "/mcp.claude.json", JSON.stringify({ mcpServers: doors }));
+
+// hooks.deny 번역: 파일 도구 전계열은 권한 deny 규칙으로, 전 도구는 PreToolUse 가드로 이중으로 막는다.
+// 훅은 permission mode 와 무관하게 돌므로 headless 의 skip-permissions 에서도 산다
+const deny = meta.hooks?.deny ?? [];
+const home = os.homedir();
+const abs = deny.map((p) => path.resolve(p.startsWith("~") ? home + p.slice(1) : p));
+const rule = (p) => (p.startsWith("~") ? p : "/" + p.replace(/^\/+/, "")) + "/**";
+fs.writeFileSync(B + "/settings.json", JSON.stringify({
+  permissions: { deny: deny.flatMap((p) => ["Read(" + rule(p) + ")", "Edit(" + rule(p) + ")"]) },
+  hooks: { PreToolUse: [{ matcher: ".*", hooks: [{ type: "command", command: "node " + JSON.stringify(path.join(B, "deny-guard.mjs")) }] }] },
+}, null, 2));
+
+// Bash 검사는 문자열 휴리스틱이라 우회 여지가 있다 — 가드레일이지 샌드박스가 아니다.
+// 홈 하위 경로는 절대형·~형·$HOME 형 세 표기를 전부 니들로 만든다
+const needles = [...new Set(abs.flatMap((a) => (a.startsWith(home) ? [a, "~" + a.slice(home.length), "$HOME" + a.slice(home.length)] : [a])))];
+fs.writeFileSync(B + "/deny-guard.mjs", [
+  "import { resolve } from \"node:path\";",
+  "const DENY_ABS = " + JSON.stringify(abs) + ";",
+  "const NEEDLES = " + JSON.stringify(needles) + ";",
+  "let d = \"\";",
+  "process.stdin.on(\"data\", (c) => (d += c));",
+  "process.stdin.on(\"end\", () => {",
+  "  let input = {};",
+  "  try { input = JSON.parse(d).tool_input ?? {}; } catch {}",
+  "  for (const k of [\"file_path\", \"path\", \"notebook_path\"]) {",
+  "    if (typeof input[k] !== \"string\") continue;",
+  "    const r = resolve(process.cwd(), input[k]);",
+  "    if (DENY_ABS.some((a) => r === a || r.startsWith(a + \"/\"))) block(r);",
+  "  }",
+  "  const cmd = typeof input.command === \"string\" ? input.command : \"\";",
+  "  const hit = NEEDLES.find((n) => cmd.includes(n));",
+  "  if (hit) block(hit);",
+  "  process.exit(0);",
+  "});",
+  "function block(what) {",
+  "  process.stderr.write(\"relay 담장: \" + what + \" 는 이 세션에서 접근 금지\");",
+  "  process.exit(2);",
+  "}",
+].join("\n"));
+'
+
+# setting-sources 를 비우면 사용자 개인 설정(~/.claude 의 스킬·커맨드·에이전트·메모리)이 배제된다 —
+# 자격은 그대로 살아 있다(실측: apiKeySource none 으로도 구독 세션이 성립). 이것이 자격을 끊지
+# 않으면서 얻는 유일한 격리다. strict-mcp-config 는 사용자의 MCP 서버가 섞이지 않게 한다
+ARGS=(
+  --mcp-config "$B/mcp.claude.json"
+  --strict-mcp-config
+  --setting-sources ""
+  --settings "$B/settings.json"
+  --append-system-prompt-file "$B/system.md"
+  --plugin-dir "$B/plugin"
+)
+if [ -n "${RELAY_MODEL:-}" ]; then
+  ARGS+=(--model "$RELAY_MODEL")
+fi
+# 모르는 강도는 무시한다 — 그대로 흘리면 도구가 인자를 거부해 세션이 통째로 죽는다.
+# 어휘 근거는 claude --help 의 --effort <level> (low, medium, high, xhigh, max)
+if [ -n "${RELAY_EFFORT:-}" ]; then
+  if ! claude --help 2>/dev/null | grep -q -- '--effort'; then
+    echo "RELAY_EFFORT 무시 — 이 claude 버전은 --effort 를 모른다" >&2
+  elif [[ " low medium high xhigh max " == *" $RELAY_EFFORT "* ]]; then
+    ARGS+=(--effort "$RELAY_EFFORT")
+  else
+    echo "RELAY_EFFORT 무시 — 모르는 강도: $RELAY_EFFORT (low|medium|high|xhigh|max)" >&2
+  fi
+fi
+# 인터랙티브 TUI — 봉투를 거치지 않는 유일한 세션 경로. 연속 포인터는 여기서만 bash 가 잇고,
+# 봉투 경로(session 프롬프트·serve 상주)의 포인터는 봉투가 소유한다(죽은 포인터 복구가 봉투 관할)
+if [ "$VERB" = "session" ] && { [ $# -le 1 ] || [ -z "${2:-}" ]; }; then
+  if [ -f "$B/claude-session" ]; then
+    ARGS+=(--resume "$(cat "$B/claude-session")")
+  fi
+  exec claude "${ARGS[@]}"
+fi
+
+# 세션 봉투(protocol 3): claude 의 stream-json 을 relay 이벤트로 번역한다. 계약 정본은
+# docs/harness-protocol.md. 두 모드가 한 봉투다 — session <프롬프트> 는 1턴 뒤 은퇴하고,
+# serve 는 상주하며 stdin 으로 턴({"type":"turn","prompt":…})을 받는다. stdin 은 제어 채널이라
+# {"type":"cancel"} 은 도구를 끊고, {"type":"answer"} 는 대기 중 질문(ask)을 회송한다.
+# 상주의 물리적 근거: -p --input-format stream-json 에서 stdin 을 열어두면 result 후에도
+# 프로세스가 살고, 다음 user 프레임이 같은 대화의 다음 턴이 되며, stdin EOF 로 자연 종료한다
+# (실측 2026-08-10, 2.1.153). 턴 경계 = result. 백그라운드 작업(run_in_background)은 완료 시
+# 입력 없이 자발 재기동을 만들고, EOF 후에도 도구가 스스로 완주까지 드레인한다(실측 2026-08-12).
+# 실패를 텍스트로 위장하지 않는다: 실패는 error 이벤트 + 비0 종료코드로만 낸다
+# Windows: node 의 spawn 은 PATH 의 확장자 없는 npm shim(claude)이나 .cmd 를 실행하지 못하고
+# ENOENT 로 즉사한다(실측 2026-08-10, Windows 10 / Node 24). bash 는 shim 을 읽어 exec 하므로
+# 대화형(exec claude)은 살아 있지만 봉투 경로만 죽는다. 실행 계획을 여기서 정해 봉투에 넘긴다:
+#   - RELAY_CLAUDE_BIN 이 오면 그 값 그대로 (레이아웃을 아는 운영자의 이스케이프 해치, 전 플랫폼)
+#   - shim 이 진짜 .exe 면 그 절대경로를 Windows 형으로 (네이티브 인스톨러·scoop·volta)
+#   - 그 외(npm 의 sh shim)는 bash 로 감싼다 — 설치 레이아웃·패키지 내부 구조를 추측하지 않는
+#     유일한 길이다. bash 는 지금 이 스크립트를 돌리는 실행 파일이라 항상 있고 node 가 spawn 한다
+# 판정 불능을 조용히 넘기지 않는다: 죽을 것이 확실한 값으로 강등하는 대신 여기서 즉시 판정한다
+CLAUDE_BIN="${RELAY_CLAUDE_BIN:-claude}"
+CLAUDE_SHIM=""
+if [ -z "${RELAY_CLAUDE_BIN:-}" ]; then
+  case "$OSTYPE" in
+    msys*|cygwin*)
+      SHIM="$(command -v claude || true)"
+      case "$SHIM" in
+        "")
+          echo "claude CLI 없음: npm install -g @anthropic-ai/claude-code" >&2
+          exit 3
+          ;;
+        /*.exe)
+          CLAUDE_BIN="$(cygpath -w "$SHIM")"
+          ;;
+        /*)
+          CLAUDE_BIN="$(cygpath -w "$(command -v bash)")"
+          CLAUDE_SHIM="$SHIM"
+          ;;
+        *)
+          # 경로가 아닌 값(함수·alias·상대경로) — 상대 해석은 워크스페이스의 바이너리를 집을 수 있다
+          echo "claude 해석 불능 — command -v 가 절대경로가 아닌 값을 냈습니다: $SHIM" >&2
+          exit 3
+          ;;
+      esac
+      ;;
+  esac
+fi
+
+B="$B" CLAUDE_BIN="$CLAUDE_BIN" CLAUDE_SHIM="$CLAUDE_SHIM" exec node --input-type=module -e '
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import readline from "node:readline";
+const B = process.env.B;
+const MODE = process.argv[1];          // "session" = 1턴 봉투 · "serve" = 상주(턴은 stdin 주입)
+const baseArgs = process.argv.slice(3);
+// 실행 계획은 bash 가 정했다: CLAUDE_BIN(node 가 spawn 할 실행 파일) + CLAUDE_SHIM(있으면
+// bash 로 읽는 npm shim 경로 — Windows 전용, argv 선두에 앉는다)
+const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
+const CLAUDE_SHIM = process.env.CLAUDE_SHIM ? [process.env.CLAUDE_SHIM] : [];
+const emit = (o) => process.stdout.write(JSON.stringify(o) + "\n");
+
+let meta = {};
+try { meta = JSON.parse(fs.readFileSync(B + "/meta.json", "utf8")); } catch { /* 무대 없이도 돈다 */ }
+const stage = typeof meta.stage === "string" ? path.resolve(meta.stage) : null;
+
+// 기판 화면은 패키지 커맨드를 선언 이름으로 보여주지만 도구는 플러그인 접두로만 푼다
+function translateSlash(prompt) {
+  try {
+    const sl = JSON.parse(fs.readFileSync(B + "/slash.json", "utf8"));
+    const hit = /^\/([A-Za-z0-9][A-Za-z0-9_-]*)(?=$|\s)/.exec(prompt);
+    if (hit && sl.names.includes(hit[1])) return "/" + sl.prefix + ":" + prompt.slice(1);
+  } catch { /* 커맨드 없는 패키지 */ }
+  return prompt;
+}
+
+const WRITERS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+const ARGS_CAP = 2048;     // tool start 의 args(JSON) 상한 — events 장부가 무한히 살찌지 않게
+const RESULT_CAP = 8192;   // tool end 의 result 상한 — 위젯 펼침 카드용, 전문은 도구 몫
+const tools = new Map();   // tool_use_id -> { name, file }
+let model = null;          // 본류가 실제로 말한 모델
+
+// 턴 상태 — kind: "injected"(주입) | "task"(백그라운드 완료의 자발 continuation).
+// null = 유휴. 자발 턴은 sawTaskDone 게이트를 통과한 본류 프레임에서만 열린다
+let turn = null;           // { kind, prompt?, said, filed:Set, restarted, done, ctxIn }
+let pendingInject = null;  // 자발 턴 진행 중 도착한 주입 — 자발 정산 뒤 발사 (교차 배선 방지)
+
+// usage 티커 — 입력은 message_start(캐시 포함), 출력은 완결 프레임 합(정확) +
+// 완결 사이 스트리밍 문자수/4(추정). 완결 도착 시 추정분을 0 으로 스냅한다.
+// thinking 델타도 문자수로 태운다 — 장고 구간에 티커가 죽어 보이지 않게
+let tickIn = 0;
+let tickOutExact = 0;
+let tickEstChars = 0;
+let tickTimer = null;
+function tickUsage() {
+  if (tickTimer) return;
+  tickTimer = setTimeout(() => {
+    tickTimer = null;
+    emit({ event: "usage", input: tickIn, output: tickOutExact + Math.round(tickEstChars / 4) });
+  }, 250);
+  tickTimer.unref?.();
+}
+function resetTick() {
+  if (tickTimer) { clearTimeout(tickTimer); tickTimer = null; }
+  tickIn = 0;
+  tickOutExact = 0;
+  tickEstChars = 0;
+}
+
+// 백그라운드 원장 — 드레인(은퇴 유예)과 task 이벤트의 근거
+const tasks = new Map();   // task_id -> note
+let sawTaskDone = false;   // 자발 턴 승격 게이트 — 유령 턴 방지 (relayos 실측 계보)
+
+// 대기 중 ask(AskUserQuestion) 1건 — 한 번에 하나(단일 질문 계약)
+let ask = null;            // { reqId, input, timer }
+
+// 죽은 resume 포인터는 복구 대상이다. 계약은 "있으면 잇고, 없으면 새로" — 없는 과거가
+// 현재 턴을 죽이면 그 슬롯은 영영 실패를 반복한다 (실측 2026-08-09, 2.1.153)
+const RESUME_GONE = "No conversation found with session ID";
+
+let child = null;
+let resumedBoot = false;
+let restarting = false;
+let restarted = false;
+let cancelled = false;
+let closing = false;
+let retired = false;       // retire 는 한 번만 — 정산 경로와 EOF 경로가 겹칠 수 있다
+let killTimer = null;
+
+function boot() {
+  // 꼬리 로그는 이번 실행 것만 남긴다 — 누적하면 지난 실행 오류로 엉뚱한 진단을 낸다
+  const errLog = fs.createWriteStream(B + "/stderr.log", { flags: "w" });
+  const args = [...baseArgs];
+  resumedBoot = false;
+  try {
+    const sid = fs.readFileSync(B + "/claude-session", "utf8").trim();
+    if (sid) { args.push("--resume", sid); resumedBoot = true; }
+  } catch { /* 첫 대화 */ }
+  child = spawn(CLAUDE_BIN, [
+    ...CLAUDE_SHIM,
+    "-p", "--input-format", "stream-json",
+    "--output-format", "stream-json", "--include-partial-messages", "--verbose",
+    "--dangerously-skip-permissions",
+    // ask 의 물리적 근거: skip-permissions 아래서도 AskUserQuestion 만은 이 채널의
+    // control_request 로 올라온다 (실측 2026-08-12, 2.1.153)
+    "--permission-prompt-tool", "stdio",
+    ...args,
+  ], { stdio: ["pipe", "pipe", "pipe"] });
+  // spawn 실패(ENOENT 등)는 close 이벤트가 오지 않는다 — 계약대로 여기서 종결한다
+  child.on("error", (e) => {
+    emit({ event: "error", message: "claude 실행 실패: " + (e?.message ?? e) + " (bin: " + CLAUDE_BIN + ")" });
+    process.exit(1);
+  });
+  child.stderr.pipe(errLog);
+  const rl = readline.createInterface({ input: child.stdout });
+  rl.on("line", onLine);
+  child.on("close", (code) => { rl.close(); onClaudeClose(code); });
+}
+const relay = (sig) => process.on(sig, () => child?.kill(sig));
+relay("SIGTERM");
+relay("SIGINT");
+
+function inject(prompt, opts = {}) {
+  turn = { kind: "injected", prompt, said: "", filed: new Set(), restarted: !!opts.restarted, done: false, ctxIn: 0 };
+  resetTick();
+  if (!child) boot();
+  child.stdin.write(JSON.stringify({
+    type: "user",
+    message: { role: "user", content: [{ type: "text", text: translateSlash(prompt) }] },
+  }) + "\n");
+}
+
+function openSpont() {
+  turn = { kind: "task", said: "", filed: new Set(), restarted: false, done: false, ctxIn: 0 };
+  resetTick();
+}
+
+// 은퇴: stream-json 입력 종료 = claude 자연 종료. 상주에서 미완 백그라운드가 있으면
+// 드레인이다 — 도구가 작업 완주까지 살았다가 스스로 내려오므로(실측) 강제 시계를 걸지 않는다.
+// 1턴 모드는 relayos one-off 계약을 따라 정산 즉시 내려간다(백그라운드 연속은 상주 전용)
+function retire() {
+  if (retired) {
+    if (!child) process.exit(process.exitCode ?? 0);
+    return;
+  }
+  retired = true;
+  closing = true;
+  if (!child) process.exit(process.exitCode ?? 0);
+  try { child.stdin.end(); } catch { /* 이미 닫힘 */ }
+  if (MODE !== "serve" || tasks.size === 0) {
+    killTimer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* 이미 종료 */ } }, 8000);
+    killTimer.unref?.();
+  }
+}
+
+function afterSettle() {
+  turn = null;
+  if (MODE === "session") return retire();
+  if (pendingInject != null) {
+    const p = pendingInject;
+    pendingInject = null;
+    inject(p);
+    return;
+  }
+  // 드레인 중이면 미완 작업이 다 끝나고 continuation 까지 배달된 뒤에야 내려간다.
+  // stdin 을 먼저 닫으면 CLI 버전에 따라 마지막 continuation 이 유실된다(실측 2.1.222)
+  if (closing && tasks.size === 0) retire();
+}
+
+// ── control 채널 (CLI stdout 의 control_request) ─────────────────────────────
+function controlRespond(reqId, payload) {
+  try {
+    child.stdin.write(JSON.stringify({
+      type: "control_response",
+      response: { subtype: "success", request_id: reqId, response: payload },
+    }) + "\n");
+  } catch { /* 이미 닫힘 */ }
+}
+
+function askSettle(answers, denyMsg) {
+  if (!ask) return;
+  const a = ask;
+  ask = null;
+  clearTimeout(a.timer);
+  if (!answers || !answers.length) {
+    controlRespond(a.reqId, { behavior: "deny", message: denyMsg ?? "사용자가 응답을 취소했습니다 — 질문 없이 진행하세요." });
+    return;
+  }
+  const map = {};
+  for (const p of answers) {
+    if (p && typeof p.question === "string" && p.question) {
+      map[p.question] = Array.isArray(p.selected) ? p.selected.join(", ") : String(p.selected ?? "");
+    }
+  }
+  controlRespond(a.reqId, { behavior: "allow", updatedInput: { ...a.input, answers: map } });
+}
+
+function onControlRequest(j) {
+  const req = j.request ?? {};
+  const reqId = j.request_id;
+  if (!reqId) return;
+  if (req.subtype === "can_use_tool" && req.tool_name === "AskUserQuestion") {
+    if (ask) {
+      controlRespond(reqId, { behavior: "deny", message: "이미 대기 중인 질문이 있습니다 — 한 번에 하나씩 질문하세요." });
+      return;
+    }
+    ask = {
+      reqId,
+      input: req.input ?? {},
+      timer: setTimeout(() => askSettle(null, "사용자가 10분 내에 응답하지 않았습니다 — 합리적인 기본값으로 진행하거나 다음 턴에서 다시 확인하세요."), 600000),
+    };
+    ask.timer.unref?.();
+    emit({ event: "ask", id: reqId, questions: Array.isArray(req.input?.questions) ? req.input.questions : [] });
+    return;
+  }
+  if (req.subtype === "can_use_tool") {
+    // skip-permissions 아래선 도착하지 않는 게 정상 — 도착해도 무인 턴 계약(전부 허용)을 유지한다
+    const payload = { behavior: "allow" };
+    if (req.input != null) payload.updatedInput = req.input;
+    controlRespond(reqId, payload);
+    return;
+  }
+  // 미지의 control 요청 — 빈 성공 회신 (무응답이면 CLI 가 대기 행으로 굳는다, relayos 실측)
+  controlRespond(reqId, {});
+}
+
+function onSystem(j) {
+  if (j.subtype === "task_started" && j.task_id) {
+    tasks.set(j.task_id, j.description ?? "");
+    emit({ event: "task", id: j.task_id, status: "started", ...(j.description ? { note: String(j.description).slice(0, 200) } : {}) });
+  } else if (j.subtype === "task_notification" && j.task_id) {
+    tasks.delete(j.task_id);
+    sawTaskDone = true;
+    emit({ event: "task", id: j.task_id, status: "done", ok: j.status === "completed" });
+    // 드레인 중 마지막 작업이 끝났다 — continuation 이 곧 열린다. 안 여는 구현 대비 유예 후 은퇴
+    if (closing && tasks.size === 0) {
+      const t = setTimeout(() => { if (closing && !turn && tasks.size === 0) retire(); }, 30000);
+      t.unref?.();
+    }
+  }
+}
+
+const onLine = (line) => {
+  let j;
+  try { j = JSON.parse(line); } catch { return; }
+
+  // control 프레임은 대화 스트림이 아니다 — 턴 귀속 없이 여기서 소화한다
+  if (j.type === "control_request") return void onControlRequest(j);
+  if (typeof j.type === "string" && j.type.startsWith("control_")) return;
+  if (j.type === "system") return void onSystem(j);
+
+  // 유휴에 흘러오는 본류 프레임 = 백그라운드 완료의 자발 턴(continuation).
+  // 선행 task 완료 신호가 있을 때만 턴으로 승격한다 — 잔류 프레임의 유령 턴 방지
+  if (!turn) {
+    if (MODE !== "serve" || !sawTaskDone) return;
+    sawTaskDone = false;
+    openSpont();
+  }
+
+  // 중간 텍스트는 부분 청크에서 뽑는다. 서브에이전트(parent_tool_use_id 있음)의 말은
+  // 본류 답변이 아니므로 흘리지 않는다. thinking 은 화면에 내지 않지만 토큰은 태운다
+  if (j.type === "stream_event") {
+    if (j.parent_tool_use_id != null) return;
+    const e = j.event;
+    if (e?.type === "message_start" && e.message?.usage) {
+      const u = e.message.usage;
+      tickIn = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+      tickUsage();
+    } else if (e?.type === "content_block_delta" && e.delta?.type === "text_delta" && e.delta.text) {
+      turn.said += e.delta.text;
+      tickEstChars += e.delta.text.length;
+      tickUsage();
+      emit({ event: "delta", text: e.delta.text });
+    } else if (e?.type === "content_block_delta" && e.delta?.type === "thinking_delta" && e.delta.thinking) {
+      tickEstChars += String(e.delta.thinking).length;
+      tickUsage();
+    }
+    return;
+  }
+  if (j.type === "assistant") {
+    if (j.parent_tool_use_id == null && j.message?.model) model = j.message.model;
+    // 완결 프레임 — 출력을 정확값으로 스냅하고, 문맥 점유(ctxIn)는 마지막 본류 프레임의
+    // usage 가 정본이다. result.usage 는 툴 왕복마다 cache_read 가 누적돼 점유량이 아니다
+    if (j.parent_tool_use_id == null && j.message?.usage) {
+      const u = j.message.usage;
+      tickOutExact += u.output_tokens ?? 0;
+      tickEstChars = 0;
+      turn.ctxIn = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.output_tokens ?? 0);
+      tickUsage();
+    }
+    for (const b of j.message?.content ?? []) {
+      if (b.type !== "tool_use") continue;
+      const file = [b.input?.file_path, b.input?.notebook_path].find((x) => typeof x === "string");
+      tools.set(b.id, { name: b.name, file });
+      const d = b.input?.command ?? file ?? b.input?.path ?? b.input?.pattern ?? b.input?.skill ?? b.input?.description ?? "";
+      let args = "";
+      try { args = JSON.stringify(b.input ?? {}); } catch { /* 직렬화 불능 입력 — args 없이 */ }
+      emit({
+        event: "tool", status: "start", id: b.id, name: b.name,
+        // 서브에이전트(위임받은 쪽)의 도구 호출은 위임 tool_use 를 부모로 단다 — 화면이 중첩으로 그린다
+        ...(j.parent_tool_use_id ? { parent: j.parent_tool_use_id } : {}),
+        ...(d ? { detail: String(d).slice(0, 200) } : {}),
+        ...(args && args !== "{}" ? { args: args.slice(0, ARGS_CAP) } : {}),
+      });
+    }
+  } else if (j.type === "user") {
+    for (const b of j.message?.content ?? []) {
+      if (b.type !== "tool_result" || !tools.has(b.tool_use_id)) continue;
+      const t = tools.get(b.tool_use_id);
+      tools.delete(b.tool_use_id);
+      const body = typeof b.content === "string" ? b.content
+        : Array.isArray(b.content) ? b.content.filter((x) => x?.type === "text").map((x) => x.text ?? "").join("\n") : "";
+      emit({
+        event: "tool", status: "end", id: b.tool_use_id, name: t.name, ok: b.is_error !== true,
+        ...(body ? { result: String(body).slice(0, RESULT_CAP) } : {}),
+      });
+      // 무대 산출물은 성공한 쓰기에서만 알린다 — 진행 중 화면과 종결 뒤 diff 사이를 메운다
+      if (b.is_error === true || !t.file || !stage || !WRITERS.has(t.name)) continue;
+      const abs = path.resolve(t.file);
+      if (!abs.startsWith(stage + path.sep)) continue;
+      const rel = path.relative(stage, abs);
+      if (turn.filed.has(rel)) continue;
+      turn.filed.add(rel);
+      emit({ event: "file", path: rel });
+    }
+  } else if (j.type === "result") {
+    if (!turn || turn.done) return;
+    // 죽은 resume 포인터의 실패 결과 — 종결로 받지 않고 새 세션으로 다시 시도한다
+    if (j.is_error && resumedBoot && !restarted
+      && (Array.isArray(j.errors) ? j.errors : []).some((e) => String(e).includes(RESUME_GONE))) {
+      restarting = true;
+      child.kill("SIGTERM");
+      return;
+    }
+    // 빈 껍데기 result — 본문도 장부도 없는 것은 종결이 아니다. 장부는 **실질**로 판정한다:
+    // usage 객체가 있어도 토큰이 전부 0 이면 모델이 돌지 않은 것이다. 실사고(2026-08-20) —
+    // 재기동 직후 resume 부팅에서 이전 대화의 pending task 배달과 주입 턴이 경합하자 CLI 가
+    // usage {0,0} 를 단 빈 result 를 냈고, 객체 존재만 보던 이 방어를 통과해 "완료 · 1.5s" 에
+    // 빈 답이 앉았다. 무시하면 진짜 result 가 뒤따르거나, 없으면 stall 타이머가 정직하게 운다.
+    const ledgered = j.usage && ((j.usage.input_tokens ?? 0) + (j.usage.output_tokens ?? 0)
+      + (j.usage.cache_read_input_tokens ?? 0) + (j.usage.cache_creation_input_tokens ?? 0)) > 0;
+    if (!j.is_error && !String(j.result ?? "").trim() && !turn.said.trim() && !ledgered) return;
+    turn.done = true;
+    resetTick();
+    if (j.session_id) fs.writeFileSync(B + "/claude-session", j.session_id);
+    const text = String(j.result ?? "").trim() || turn.said.trim();
+    if (j.is_error) {
+      // 취소로 죽어가는 CLI 는 is_error result 에 중단 시점의 부분 본문을 실어 온다 — 그대로
+      // 사유로 쓰면 이력에 "오류: <부분 텍스트>" 가 남는다. 취소 턴의 사유는 취소 사실이다
+      emit({ event: "error", message: cancelled ? "취소됨" : (text.trim() || ("claude 실패 (" + (j.subtype ?? "사유 없음") + ")")) });
+      if (MODE === "session") { process.exitCode = 1; retire(); }
+      else afterSettle();
+      return;
+    }
+    const mu = j.modelUsage && typeof j.modelUsage === "object" ? j.modelUsage : {};
+    const name = model
+      ?? Object.entries(mu).sort((a, b) => (b[1]?.outputTokens ?? 0) - (a[1]?.outputTokens ?? 0))[0]?.[0]
+      ?? null;
+    const u = j.usage ?? {};
+    emit({
+      event: "reply",
+      ...(turn.kind === "task" ? { origin: "task" } : {}),
+      text: turn.restarted ? "(이전 대화가 하네스에서 만료되어 새 대화로 시작했습니다.)\n\n" + text : text,
+      session: j.session_id ?? null,
+      model: name,
+      usage: {
+        input: (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0),
+        output: u.output_tokens ?? 0,
+        context_window: (name && mu[name]?.contextWindow) ?? null,
+        // additive 세분(하위호환): input 은 위 그대로 캐시 포함 합계로 남는다 — 비캐시 입력이
+        // 필요한 기판은 input - cache_read - cache_creation 으로 되구한다. cost 는 도구 자기 정산액
+        cache_read: u.cache_read_input_tokens ?? 0,
+        cache_creation: u.cache_creation_input_tokens ?? 0,
+        ...(typeof j.total_cost_usd === "number" ? { cost_usd: j.total_cost_usd } : {}),
+      },
+      // 점유율 게이지의 정본 — 마지막 본류 프레임의 usage. result.usage 는 누적이라 부푼다
+      context: { input: turn.ctxIn || null, window: (name && mu[name]?.contextWindow) ?? null },
+    });
+    afterSettle();
+  }
+};
+
+// 제어 채널: turn(상주 주입) · cancel(중단) · answer(ask 회송). EOF = 은퇴 지시
+let ctl = null;
+try {
+  ctl = readline.createInterface({ input: process.stdin });
+  ctl.on("line", (line) => {
+    let c;
+    try { c = JSON.parse(line); } catch { return; }
+    if (c?.type === "cancel") {
+      if (cancelled) return;
+      cancelled = true;
+      askSettle(null); // 대기 중 질문도 함께 접는다 — 회신 없이 죽으면 CLI 가 대기 행으로 남는다
+      if (!child) process.exit(130);
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* 이미 종료 */ } }, 3000);
+      killTimer.unref?.();
+      return;
+    }
+    if (c?.type === "answer") {
+      if (ask && (!c.id || c.id === ask.reqId)) askSettle(Array.isArray(c.answers) ? c.answers : null);
+      return;
+    }
+    if (c?.type === "turn" && MODE === "serve") {
+      if (closing || cancelled) {
+        // 은퇴/취소는 사형선고라 이 상주에 새 턴은 계약 위반이다 — 조용히 삼키면 기판의
+        // exit 감시가 "하네스 상주 종료" 로 늦게 울린다. 즉시 error 로 종결시켜 원인을 밝힌다
+        emit({ event: "error", message: "취소로 내려가는 상주에 턴이 주입되었습니다 — 새 상주로 다시 보내세요" });
+        return;
+      }
+      if (typeof c.prompt !== "string" || !c.prompt.trim()) return;
+      if (turn) {
+        // 자발 턴 진행 중의 주입은 큐잉한다(교차 배선 방지). 주입 턴 위의 주입은 기판이 막는다
+        if (turn.kind === "task" && pendingInject == null) pendingInject = c.prompt;
+        else process.stderr.write("relay 봉투: 턴 진행 중 — 새 턴 무시\n");
+        return;
+      }
+      inject(c.prompt);
+    }
+  });
+  ctl.on("close", () => {
+    if (turn && !turn.done) { closing = true; return; }
+    // 유휴지만 미완 백그라운드가 있다 — claude 의 stdin 은 열어 둔 채(상주 유지) 드레인한다
+    if (MODE === "serve" && tasks.size > 0) { closing = true; return; }
+    retire();
+  });
+  ctl.on("error", () => { /* 제어 채널 없음 — 신호로만 취소된다 */ });
+} catch { /* stdin 이 없는 환경 */ }
+
+function onClaudeClose(code) {
+  if (killTimer) clearTimeout(killTimer);
+  askSettle(null);
+  let tail = "";
+  try { tail = fs.readFileSync(B + "/stderr.log", "utf8").trim().split("\n").slice(-3).join(" / "); } catch { /* 로그 없음 */ }
+  if (!restarting && !cancelled && !closing && turn && !turn.done
+    && resumedBoot && !restarted && tail.includes(RESUME_GONE)) {
+    restarting = true;
+  }
+  if (restarting && !cancelled) {
+    restarting = false;
+    restarted = true;
+    fs.rmSync(B + "/claude-session", { force: true });
+    child = null;
+    inject(turn.prompt, { restarted: true });
+    return;
+  }
+  if (closing) process.exit(process.exitCode ?? 0);
+  if (cancelled) {
+    if (turn && !turn.done) emit({ event: "error", message: "취소됨" });
+    process.exit(130);
+  }
+  if (turn && !turn.done) {
+    emit({ event: "error", message: "claude 응답 없음 (exit " + code + ")" + (tail ? " — " + tail : "") });
+    process.exit(1);
+  }
+  // 유휴 중 사망 — 상주는 끝났다. 다음 턴은 새 상주가 디스크의 대화를 fresh resume 으로 잇는다
+  process.exit(1);
+}
+
+if (MODE === "session") inject(process.argv[2] ?? "");
+// serve 는 첫 턴 주입을 기다린다 — claude 부트도 그때다(resume 사다리를 첫 턴에 국한)
+' "$VERB" "${2:-}" "${ARGS[@]}"
