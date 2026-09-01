@@ -45,16 +45,21 @@
   }
   .card:hover { transform: translateY(-2px); box-shadow: 0 8px 22px rgba(60,50,30,.08); border-color: #ddd6cb; }
   .card:focus-visible { outline: 2px solid #c9a24a; outline-offset: 2px; }
-  .card .period { font-size: 12px; color: #9a948a; margin-bottom: 8px; letter-spacing: .01em; }
-  .card .t { font-weight: 600; font-size: 16px; line-height: 1.35; margin: 0 0 10px; }
+  .card .t { font-weight: 600; font-size: 16px; line-height: 1.35; margin: 0 0 12px; }
+  .card .topics { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; flex: 1; align-content: flex-start; }
+  .card .chip {
+    font-size: 12px; color: #5a554d; background: #f3f0e9; border: 1px solid #e7e2d9;
+    border-radius: 8px; padding: 3px 9px; line-height: 1.5;
+  }
   .card .p {
     font-size: 13px; color: #6a655d; line-height: 1.6; margin: 0; flex: 1;
     overflow: hidden; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical;
   }
-  .card .foot { margin-top: 12px; display: flex; align-items: center; gap: 6px; }
+  .card .foot { margin-top: 14px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .card .period { font-size: 12px; color: #9a948a; }
   .card .badge {
     font-size: 11px; color: #7a6a45; background: #fbf3df; border: 1px solid #f0e2c4;
-    border-radius: 999px; padding: 2px 9px; font-weight: 500;
+    border-radius: 999px; padding: 2px 9px; font-weight: 500; white-space: nowrap;
   }
 
   .empty { padding: 8px 4px; color: #8a857c; font-size: 14px; line-height: 1.7; max-width: 560px; }
@@ -165,6 +170,11 @@ function fmtPeriod(d) {
   return d.period_end || d.period_start || "";
 }
 
+// 미리보기 글에 남은 서식 기호를 걷어낸다 (주제가 없을 때의 보조 표시).
+function cleanText(s) {
+  return String(s == null ? "" : s).replace(/[*`#]+/g, "").replace(/\s+/g, " ").trim();
+}
+
 function renderGallery() {
   if (!digests.length) {
     $gallery.innerHTML = `
@@ -175,13 +185,23 @@ function renderGallery() {
       </div>`;
     return;
   }
-  const cards = digests.map((d) => `
+  const cards = digests.map((d) => {
+    const topics = Array.isArray(d.topics) ? d.topics : [];
+    let inner;
+    if (topics.length) {
+      const shown = topics.slice(0, 8);
+      const extra = topics.length - shown.length;
+      inner = `<div class="topics">${shown.map((t) => `<span class="chip">${esc(t)}</span>`).join("")}${extra > 0 ? `<span class="chip">+${extra}</span>` : ""}</div>`;
+    } else {
+      inner = `<p class="p">${esc(cleanText(d.preview))}</p>`;
+    }
+    return `
     <div class="card" role="button" tabindex="0" data-id="${esc(d.id)}">
-      <div class="period">${esc(fmtPeriod(d))}</div>
       <div class="t">${esc(d.title)}</div>
-      <p class="p">${esc(d.preview || "")}</p>
-      <div class="foot"><span class="badge">메모 ${d.memo_count || 0}개</span></div>
-    </div>`).join("");
+      ${inner}
+      <div class="foot"><span class="period">${esc(fmtPeriod(d))}</span><span class="badge">메모 ${d.memo_count || 0}개</span></div>
+    </div>`;
+  }).join("");
   $gallery.innerHTML = `<div class="count">정리 ${digests.length}개</div>` + cards;
   for (const el of $gallery.querySelectorAll(".card")) {
     const id = el.getAttribute("data-id");

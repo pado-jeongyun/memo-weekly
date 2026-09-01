@@ -6,7 +6,7 @@ interface Ctx {
 
 export const meta = {
   description:
-    "저장된 주간 메모 정리 목록을 최신순으로 준다. 각 항목에 id·제목·기간·메모 수·미리보기가 실린다. limit 로 개수를 제한한다(기본 20).",
+    "저장된 주간 메모 정리 목록을 최신순으로 준다. 각 항목에 id·제목·기간·메모 수·주제 목록·미리보기가 실린다. limit 로 개수를 제한한다(기본 20).",
   input: {
     type: "object",
     properties: {
@@ -14,6 +14,19 @@ export const meta = {
     },
   },
 };
+
+// 본문에서 주제 제목(## / ###)만 뽑는다 — 갤러리 카드가 무엇을 담았는지 한눈에 보이게.
+function topicsOf(body: string): string[] {
+  const out: string[] = [];
+  for (const line of String(body || "").split("\n")) {
+    const m = /^#{2,3}\s+(.+?)\s*$/.exec(line);
+    if (m) {
+      const label = m[1].replace(/[*`#]/g, "").replace(/\s*\(\d+\)\s*$/, "").trim();
+      if (label) out.push(label);
+    }
+  }
+  return out;
+}
 
 export default async function (raw: unknown, ctx: Ctx) {
   const input = asObject<{ limit?: number }>(raw);
@@ -31,6 +44,7 @@ export default async function (raw: unknown, ctx: Ctx) {
       period_end: d.period_end,
       memo_count: d.memo_count,
       created: d.created || null,
+      topics: topicsOf(d.body),
       preview: preview(d.body),
     })),
     ...(all.length ? {} : { 안내: "아직 저장된 주간 정리가 없다." }),
