@@ -2,7 +2,11 @@ schema: relay/v1
 name: "@musibe/memo-weekly"
 version: 0.1.5
 <<<<<<< HEAD
+<<<<<<< HEAD
 display_name: 주간 메모 정리
+=======
+display_name: 주간 메모 정리 뇽뇽
+>>>>>>> origin/main
 =======
 display_name: 주간 메모 정리 뇽뇽
 >>>>>>> origin/main
